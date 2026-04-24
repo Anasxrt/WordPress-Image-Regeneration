@@ -148,11 +148,11 @@ chmod +x regen-images.sh
 
 ```
 
-![](images\2026-04-24 - 1776989819.png)
+![](images/2026-04-24%20-%201776989819.png)
 
-![](images\2026-04-24 - 1776989708.png)
+![](images/2026-04-24%20-%201776989708.png)
 
-![](images\2026-04-24 - 1776989889.png)
+![](images/2026-04-24%20-%201776989889.png)
 Each line shows:
 
 - **Progress bar** with fill characters
