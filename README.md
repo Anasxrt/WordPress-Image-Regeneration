@@ -2,11 +2,17 @@
 
 > **Author**: Montri Udomariyah
 
-> **Date**: 2026-04-24
+> **Date**: 2026-04-25
 
-> **Version**: 1.1.0
+> **Version**: 1.2.0
 
 A single-file, production-ready WordPress image regeneration script with durable checkpoint/resume that survives system crashes, fatal PHP errors, SIGINT/SIGTERM interruptions, out-of-memory kills, and database connection drops without losing progress or leaving partial thumbnails.
+
+## What's New in v1.2.0
+
+### New Features
+- **Failed image listing** — `--retry-failed` displays all failed attachments with ID, filename, and error details
+- **Automatic retry** — Failed images are automatically included in the pending queue on subsequent runs
 
 ## What's New in v1.1.0
 
@@ -66,6 +72,7 @@ curl -sSL https://node10.cloudrambo.com/regen-images.sh | bash -s -- --batch-siz
 - **Memory monitoring** — Triggers garbage collection and pauses when memory usage exceeds 85%
 - **Pre/post file integrity validation** — Verifies source file exists, MIME type is valid, and all generated sizes have non-zero file size
 - **Structured JSON logging** — Machine-parseable logs for monitoring and alerting
+- **Failed image listing** — `--retry-failed` shows all failed images with file paths and error messages
 - **Single file** — No dependencies beyond bash and PHP; works on any WordPress installation
 
 ## Usage
@@ -79,6 +86,7 @@ curl -sSL https://node10.cloudrambo.com/regen-images.sh | bash -s -- --batch-siz
 | --dry-run | Show what would be processed without regenerating | — |
 | --reset | Clear all state and start from scratch | — |
 | --status | Show current state summary and exit | — |
+| --retry-failed | List failed images from previous runs | — |
 | --help | Show all options | — |
 
 ### Examples
@@ -89,6 +97,9 @@ curl -sSL https://node10.cloudrambo.com/regen-images.sh | bash -s -- --batch-siz
 
 # Preview what would be processed
 ./regen-images.sh --dry-run
+
+# List failed images from previous runs
+./regen-images.sh --retry-failed
 
 # Process 10 images per batch with 10-second pauses
 ./regen-images.sh --batch-size=10 --pause=10
@@ -112,6 +123,9 @@ curl -sSL https://node10.cloudrambo.com/regen-images.sh | bash
 
 # Dry run
 curl -sSL https://node10.cloudrambo.com/regen-images.sh | bash -s -- --dry-run
+
+# List failed images
+curl -sSL https://node10.cloudrambo.com/regen-images.sh | bash -s -- --retry-failed
 
 # Custom batch size
 curl -sSL https://node10.cloudrambo.com/regen-images.sh | bash -s -- --batch-size=10 --pause=10
@@ -164,6 +178,28 @@ Each line shows:
 - **Throughput** (items/second)
 - **ETA** in human-readable format
 
+### Failed Images Listing
+
+```plaintext
+═══════════════════════════════════════════════════════
+  FAILED IMAGES (use --retry-failed to regenerate)
+═══════════════════════════════════════════════════════
+  Total failed: 4
+
+  ID 1023: broken-photo
+          File: /var/www/html/wp-content/uploads/2026/01/broken-photo.jpg
+          Error: Source file missing for attachment 1023
+
+  ID 2847: corrupted-image
+          File: /var/www/html/wp-content/uploads/2026/02/corrupted-image.png
+          Error: wp_generate_attachment_metadata returned empty/invalid result
+
+═══════════════════════════════════════════════════════
+  Use --retry-failed to regenerate 4 failed images
+═══════════════════════════════════════════════════════
+
+```
+
 ### Status Display
 
 ```plaintext
@@ -204,7 +240,7 @@ Each attachment is tracked by its **numeric ID** (not offset). After every succe
 {"ts":"2026-04-23T22:00:05+07:00","op":"success","run_id":"a1b2c3d4","id":101,"sizes":["thumbnail","medium","large"],"bytes":45231}
 
 ```
-On restart, the journal is replayed to determine which IDs are already done. If the script crashes, is killed, or the system reboots, the next run automatically resumes from the last successful item.
+On restart, the journal is replayed to determine which IDs are already done. If the script crashes, is killed, or the system reboots, the next run automatically resumes from the last successful item. Failed images remain in the pending queue and are retried on subsequent runs.
 
 ### State Files
 
@@ -234,6 +270,21 @@ wp-content/uploads/regen-state/
 | Corrupt journal | Partial lines at end (from crash mid-write) are detected during replay and skipped. Snapshot is rebuildable. |
 | Malformed image | Per-attachment error boundary catches the error, logs failed, and continues. |
 | Attachment deleted | Pre-validation checks get_post() and file_exists(). If missing, logged as failed. |
+
+## Retrying Failed Images
+After a run completes with some failures, use `--retry-failed` to list all failed attachments:
+
+```bash
+./regen-images.sh --retry-failed
+
+```
+This displays each failed image with its ID, title, file path, and the error that caused the failure. To retry failed images, simply run the script normally — failed entries are automatically included in the pending queue since only `success` status entries are excluded from processing.
+
+```bash
+# Fix the underlying issue (e.g., restore missing files), then run:
+./regen-images.sh
+
+```
 
 ## Deploying for `curl | bash` Distribution
 
@@ -298,10 +349,15 @@ Should output:
 The script is a single file with two sections:
 
 1. **Shell section** (top): Argument parsing, piped-execution detection, WordPress root detection, temp file management, signal trapping, PHP worker execution, and cleanup.
-2. **PHP section** (after `__PHP_WORKER_START__`): WordPress bootstrap, `Regen_Logger` (structured JSON logging), `Regen_Journal` (append-only log with `flock`), `Regen_Processor` (batch processing with per-attachment error boundaries, signal handling, memory monitoring, progress bar).
+2. **PHP section** (after `__PHP_WORKER_START__`): WordPress bootstrap, `Regen_Logger` (structured JSON logging), `Regen_Journal` (append-only log with `flock`), `Regen_Processor` (batch processing with per-attachment error boundaries, signal handling, memory monitoring, progress bar, failed image listing).
 When piped via `curl | bash`, the script detects that `$BASH_SOURCE` is empty, saves stdin to a temp file, passes the original working directory via an environment variable, and re-execs itself. This ensures WordPress root is detected from the user's current directory, not `/tmp/`.
 
 ## Changelog
+
+### v1.2.0 (2026-04-25)
+- Added `--retry-failed` option to list failed images from previous runs
+- Failed images display attachment ID, title, file path, and error message
+- Failed entries are automatically retried on subsequent normal runs
 
 ### v1.1.0 (2026-04-24)
 - Added secure temp file creation via `mktemp`
