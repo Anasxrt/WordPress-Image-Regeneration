@@ -3,8 +3,8 @@
 # regen-images.sh — Production-Ready WordPress Image Regeneration
 #
 # Author  : Montri Udomariyah
-# Date    : 2026-04-24
-# Version : 1.1.0
+# Date    : 2026-04-25
+# Version : 1.2.0
 #
 # Single-file solution: shell orchestrator + embedded PHP worker.
 #
@@ -17,6 +17,7 @@
 #   - Pre/post file integrity validation
 #   - Structured JSON logging
 #   - Real-time progress bar with percentage, throughput, and ETA
+#   - Failed image listing and retry via --retry-failed
 #   - Supports both direct execution and curl|bash piped distribution
 #
 # ─── Security Enhancements (v1.1.0) ───────────────────────────────────────
@@ -34,6 +35,7 @@
 #   chmod +x regen-images.sh
 #   ./regen-images.sh                          # Regenerate all images
 #   ./regen-images.sh --dry-run                # Preview what would be processed
+#   ./regen-images.sh --retry-failed           # List failed images from previous runs
 #   ./regen-images.sh --batch-size=10 --pause=10
 #   ./regen-images.sh --status                 # Show current state
 #   ./regen-images.sh --reset                  # Clear all state
@@ -75,7 +77,8 @@
 # ─── Safer Alternative (download first, then run) ─────────────────────────
 #   curl -sSL https://your-server.com/regen-images.sh -o regen-images.sh
 #   chmod +x regen-images.sh
-#   ./regen-images.sh --dry-run    # Inspect first, then run
+#   ./regen-images.sh --dry-run                # Preview what would be processed
+#   ./regen-images.sh --retry-failed           # List failed images from previous runs    # Inspect first, then run
 #
 # ─── State Files ──────────────────────────────────────────────────────────
 #   wp-content/uploads/regen-state/
@@ -143,6 +146,7 @@ PAUSE=5
 DRY_RUN="false"
 RESET="false"
 STATUS="false"
+RETRY_FAILED="false"
 STALE_THRESHOLD=120
 
 # ─── Argument Parsing with Input Validation ─────────────────────────────────
@@ -166,9 +170,11 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             shift ;;
+
         --dry-run)       DRY_RUN="true"; shift ;;
         --reset)         RESET="true"; shift ;;
         --status)        STATUS="true"; shift ;;
+        --retry-failed)  RETRY_FAILED="true"; shift ;;
         --stale-threshold=*)
             val="${1#*=}"
             if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -gt 0 ] && [ "$val" -le 3600 ]; then
@@ -187,6 +193,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --dry-run             Show what would be processed without regenerating"
             echo "  --reset               Clear all state and start from scratch"
             echo "  --status              Show current state summary and exit"
+            echo "  --retry-failed        List failed images (use regular run to regenerate them)"
             echo "  --stale-threshold=N   Seconds before a process is considered stale (default: 120)"
             echo "  -h, --help            Show this help message"
             exit 0
@@ -303,7 +310,8 @@ $pause         = (int)($argv[3] ?? 5);
 $dry_run       = ($argv[4] ?? 'false') === 'true';
 $reset         = ($argv[5] ?? 'false') === 'true';
 $status        = ($argv[6] ?? 'false') === 'true';
-$stale_threshold = (int)($argv[7] ?? 120);
+$retry_failed  = ($argv[7] ?? 'false') === 'true';
+$stale_threshold = (int)($argv[8] ?? 120);
 
 // Security: Validate numeric arguments
 if ($batch_size <= 0 || $batch_size > 1000) {
@@ -1337,6 +1345,76 @@ class Regen_Processor {
     }
 
     /**
+     * List and optionally retry failed images.
+     */
+    public function retry_failed(bool $do_retry = false): array {
+        $replay = $this->journal->replay();
+        $states = $replay['states'];
+
+        // Collect failed IDs
+        $failed_ids = [];
+        foreach ($states as $id => $state) {
+            if ($state['status'] === 'failed') {
+                $failed_ids[] = (int)$id;
+            }
+        }
+
+        if (empty($failed_ids)) {
+            WP_CLI::line("");
+            WP_CLI::line("═══════════════════════════════════════════════════════");
+            WP_CLI::line("  NO FAILED IMAGES FOUND");
+            WP_CLI::line("═══════════════════════════════════════════════════════");
+            WP_CLI::success("All images are in success state. Nothing to retry.");
+            return [];
+        }
+
+        // Sort for consistent display
+        sort($failed_ids);
+
+        WP_CLI::line("");
+        WP_CLI::line("═══════════════════════════════════════════════════════");
+        if ($do_retry) {
+            WP_CLI::line("  RETRYING FAILED IMAGES");
+        } else {
+            WP_CLI::line("  FAILED IMAGES (use --retry-failed to regenerate)");
+        }
+        WP_CLI::line("═══════════════════════════════════════════════════════");
+        WP_CLI::line("  Total failed: " . count($failed_ids));
+        WP_CLI::line("");
+
+        foreach ($failed_ids as $id) {
+            $attachment = get_post($id);
+            $file_path = $attachment ? get_attached_file($id) : false;
+            $title = $attachment ? $attachment->post_title : '(no title)';
+
+            $state = $states[$id] ?? [];
+            $error = $state['error'] ?? 'unknown error';
+
+            WP_CLI::line("  ID {$id}: {$title}");
+            if ($file_path) {
+                WP_CLI::line("          File: {$file_path}");
+            } else {
+                WP_CLI::line("          File: [MISSING]");
+            }
+            WP_CLI::line("          Error: {$error}");
+            WP_CLI::line("");
+        }
+
+        if ($do_retry) {
+            WP_CLI::line("═══════════════════════════════════════════════════════");
+            WP_CLI::line("  Starting retry for " . count($failed_ids) . " failed images...");
+            WP_CLI::line("═══════════════════════════════════════════════════════");
+            WP_CLI::line("");
+            return $failed_ids;
+        } else {
+            WP_CLI::line("═══════════════════════════════════════════════════════");
+            WP_CLI::line("  Use --retry-failed to regenerate " . count($failed_ids) . " failed images");
+            WP_CLI::line("═══════════════════════════════════════════════════════");
+            return [];
+        }
+    }
+
+    /**
      * Reset all state.
      */
     public function reset_state(): void {
@@ -1377,6 +1455,12 @@ try {
     // Handle --status
     if ($status) {
         $processor->show_status();
+        exit(0);
+    }
+
+    // Handle --retry-failed (list failed images)
+    if ($retry_failed) {
+        $processor->retry_failed(false);
         exit(0);
     }
 
