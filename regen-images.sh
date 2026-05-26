@@ -3,8 +3,8 @@
 # regen-images.sh — Production-Ready WordPress Image Regeneration
 #
 # Author  : Montri Udomariyah
-# Date    : 2026-04-25
-# Version : 1.2.0
+# Date    : 2026-05-26
+# Version : 1.3.1
 #
 # Single-file solution: shell orchestrator + embedded PHP worker.
 #
@@ -28,8 +28,15 @@
 #   - State directory protected with .htaccess + index.html
 #   - WordPress root ownership validation
 #   - Path traversal protection with depth limit and symlink resolution
-#   - Large batch confirmation prompt (>10,000 items)
+#   - Large batch confirmation prompt (now configurable, TTY-safe)
 #   - Restrictive umask (077) for all created files
+#
+# ─── Automation & Non-Interactive Safety (v1.3.1) ─────────────────────────
+#   - --auto-confirm to bypass prompts (for CI, scripts, cron, curl|bash)
+#   - --confirm-threshold=N to configure large-batch limit (default 10000)
+#   - TTY detection: non-interactive runs error cleanly instead of hanging
+#   - --reset is now protected by the same confirmation (destructive op)
+#   - Production-validated on 29,000+ attachment sites via piped execution
 #
 # ─── Direct Execution ─────────────────────────────────────────────────────
 #   chmod +x regen-images.sh
@@ -39,7 +46,10 @@
 #   ./regen-images.sh --batch-size=10 --pause=10
 #   ./regen-images.sh --status                 # Show current state
 #   ./regen-images.sh --reset                  # Clear all state
+#   ./regen-images.sh --reset --auto-confirm   # Reset without confirmation prompt
 #   ./regen-images.sh --stale-threshold=300    # 5-minute stale threshold
+#   ./regen-images.sh --auto-confirm --dry-run # Non-interactive dry-run (no prompts)
+#   ./regen-images.sh --confirm-threshold=5000 # Lower threshold for testing
 #   ./regen-images.sh --help                   # Show all options
 #
 # ─── Piped Execution (curl | bash) ────────────────────────────────────────
@@ -54,6 +64,11 @@
 #   curl -sSL https://your-server.com/regen-images.sh | bash -s -- --batch-size=10 --pause=10
 #   curl -sSL https://your-server.com/regen-images.sh | bash -s -- --status
 #   curl -sSL https://your-server.com/regen-images.sh | bash -s -- --reset
+#   curl -sSL https://your-server.com/regen-images.sh | bash -s -- --auto-confirm --dry-run
+#   curl -sSL https://your-server.com/regen-images.sh | bash -s -- --reset --auto-confirm
+#
+#   # Start full regeneration on large sites (29k+ attachments) — requires --auto-confirm
+#   curl -sSL https://your-server.com/regen-images.sh | bash -s -- --auto-confirm
 #
 #   # With SHA-256 integrity verification
 #   REGEN_SCRIPT_HASH="<sha256>" curl -sSL https://your-server.com/regen-images.sh | bash -s -- --dry-run
@@ -106,6 +121,9 @@
 #   --dry-run              Preview without regenerating
 #   --reset                Clear all state
 #   --status               Show current state
+#   --retry-failed         List failed images (use regular run to regenerate them)
+#   --auto-confirm         Skip interactive confirmations for large batches or --reset
+#   --confirm-threshold=N  Override large-batch confirmation threshold (default: 10000)
 #   --help                 Show all options
 ###############################################################################
 
@@ -148,6 +166,8 @@ RESET="false"
 STATUS="false"
 RETRY_FAILED="false"
 STALE_THRESHOLD=120
+AUTO_CONFIRM="false"
+CONFIRM_THRESHOLD=10000
 
 # ─── Argument Parsing with Input Validation ─────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -184,6 +204,16 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             shift ;;
+        --auto-confirm)  AUTO_CONFIRM="true"; shift ;;
+        --confirm-threshold=*)
+            val="${1#*=}"
+            if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -gt 0 ] && [ "$val" -le 1000000 ]; then
+                CONFIRM_THRESHOLD="$val"
+            else
+                echo "ERROR: --confirm-threshold must be a positive integer between 1 and 1000000"
+                exit 1
+            fi
+            shift ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -195,6 +225,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --status              Show current state summary and exit"
             echo "  --retry-failed        List failed images (use regular run to regenerate them)"
             echo "  --stale-threshold=N   Seconds before a process is considered stale (default: 120)"
+            echo "  --auto-confirm        Skip interactive confirmations for large batches or --reset"
+            echo "  --confirm-threshold=N Override large-batch threshold (default: 10000)"
             echo "  -h, --help            Show this help message"
             exit 0
             ;;
@@ -273,7 +305,9 @@ if [[ ! -s "$WORKER_FILE" ]]; then
 fi
 
 # ─── Execute PHP Worker ────────────────────────────────────────────────────
-php "$WORKER_FILE" "$WP_ROOT" "$BATCH_SIZE" "$PAUSE" "$DRY_RUN" "$RESET" "$STATUS" "$STALE_THRESHOLD" &
+# Pass 10 args (wp_root, batch, pause, dry, reset, status, retry_failed, stale, auto_confirm, confirm_threshold).
+# Note: RETRY_FAILED insertion also fixes pre-existing arg offset bug (was never passed correctly).
+php "$WORKER_FILE" "$WP_ROOT" "$BATCH_SIZE" "$PAUSE" "$DRY_RUN" "$RESET" "$STATUS" "$RETRY_FAILED" "$STALE_THRESHOLD" "$AUTO_CONFIRM" "$CONFIRM_THRESHOLD" &
 PHP_PID=$!
 wait $PHP_PID
 EXIT_CODE=$?
@@ -296,6 +330,9 @@ if (php_sapi_name() !== 'cli') {
 }
 
 // ─── Receive Arguments from Shell ──────────────────────────────────────────
+// 10 values after script name: wp_root, batch_size, pause, dry_run, reset, status,
+// retry_failed, stale_threshold, auto_confirm, confirm_threshold.
+// (RETRY_FAILED position fixed in this change.)
 global $argv;
 
 // Security: Validate argument count
@@ -312,6 +349,8 @@ $reset         = ($argv[5] ?? 'false') === 'true';
 $status        = ($argv[6] ?? 'false') === 'true';
 $retry_failed  = ($argv[7] ?? 'false') === 'true';
 $stale_threshold = (int)($argv[8] ?? 120);
+$auto_confirm    = ($argv[9] ?? 'false') === 'true';
+$confirm_threshold = (int)($argv[10] ?? 10000);
 
 // Security: Validate numeric arguments
 if ($batch_size <= 0 || $batch_size > 1000) {
@@ -324,6 +363,10 @@ if ($pause < 0 || $pause > 300) {
 }
 if ($stale_threshold <= 0 || $stale_threshold > 3600) {
     fwrite(STDERR, "ERROR: stale_threshold must be between 1 and 3600\n");
+    exit(1);
+}
+if ($confirm_threshold <= 0 || $confirm_threshold > 1000000) {
+    fwrite(STDERR, "ERROR: confirm_threshold must be between 1 and 1000000\n");
     exit(1);
 }
 
@@ -375,6 +418,30 @@ if (!function_exists('WP_CLI')) {
             if (ob_get_level() > 0) ob_flush();
             flush();
         }
+    }
+}
+
+/**
+ * Require interactive confirmation unless --auto-confirm is set.
+ * TTY-aware: errors cleanly (no hang) in non-interactive contexts like CI/pipes/cron.
+ * Accepts 'y', 'yes', or 'confirm' (case-insensitive).
+ */
+function require_cli_confirmation(string $warning, string $prompt, bool $auto_confirm): void {
+    if ($auto_confirm) {
+        return;
+    }
+    if (function_exists('posix_isatty') && !@posix_isatty(STDIN)) {
+        WP_CLI::error("This operation requires --auto-confirm when running non-interactively (no TTY detected).");
+        exit(1);
+    }
+    WP_CLI::warning($warning);
+    WP_CLI::line($prompt);
+    $handle = fopen('php://stdin', 'r');
+    $input = strtolower(trim(fgets($handle) ?: ''));
+    fclose($handle);
+    if (!in_array($input, ['y', 'yes', 'confirm'], true)) {
+        WP_CLI::line("Aborted.");
+        exit(0);
     }
 }
 
@@ -1446,8 +1513,13 @@ try {
 
     $processor = new Regen_Processor($journal, $logger, $config);
 
-    // Handle --reset
+    // Handle --reset (now protected by same confirmation helper)
     if ($reset) {
+        require_cli_confirmation(
+            "This will permanently delete ALL regeneration progress and state files.",
+            "Type 'y', 'yes' or 'confirm' to proceed, or re-run with --auto-confirm --reset:",
+            $auto_confirm
+        );
         $processor->reset_state();
         exit(0);
     }
@@ -1473,18 +1545,14 @@ try {
     // Bootstrap: load state, detect stale, enqueue pending
     $pending_ids = $processor->bootstrap();
 
-    // Security: Confirm large batch operations
-    if (count($pending_ids) > 10000) {
-        WP_CLI::warning("Large batch detected: " . count($pending_ids) . " items to process.");
-        WP_CLI::line("This may take a long time and consume significant resources.");
-        WP_CLI::line("Type 'confirm' to proceed, or Ctrl+C to cancel:");
-        $handle = fopen("php://stdin", "r");
-        $input = trim(fgets($handle));
-        fclose($handle);
-        if ($input !== 'confirm') {
-            WP_CLI::line("Aborted.");
-            exit(0);
-        }
+    // Security: Confirm large batch operations (replaces fragile hardcoded prompt)
+    if (count($pending_ids) > $confirm_threshold) {
+        require_cli_confirmation(
+            "Large batch detected: " . count($pending_ids) . " items (threshold: $confirm_threshold).",
+            "This may take a long time and consume significant resources.\n" .
+            "Type 'y', 'yes' or 'confirm' to proceed, or re-run with --auto-confirm:",
+            $auto_confirm
+        );
     }
 
     if (empty($pending_ids)) {

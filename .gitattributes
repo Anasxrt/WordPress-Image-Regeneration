@@ -1,0 +1,21 @@
+# Normalize line endings for cross-platform (Windows/WSL/Linux) development
+# Prevents noisy CRLF diffs on public GitHub history
+* text=auto eol=lf
+
+# Shell scripts - always LF, executable intent preserved by git
+*.sh text eol=lf
+
+# Markdown docs
+*.md text eol=lf
+
+# PHP (embedded worker)
+*.php text eol=lf
+
+# Images are binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+
+# Lockfiles / generated (if any appear later)
+*.lock text eol=lf
